@@ -17,8 +17,49 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+
+import torch.distributed as dist
+
+# -----------------------------------------------------------------------------
+# nnUNet v2 Dice uses AllGatherGrad for batch_dice and DDP. Some installations
+# call it even when torch.distributed is not initialized, which crashes.
+# We patch the symbol in nnunetv2.training.loss.dice to make it safe for
+# single-process training (world_size=1).
+# -----------------------------------------------------------------------------
+class _SafeAllGatherGrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor):
+        if dist.is_available() and dist.is_initialized():
+            world = dist.get_world_size()
+            gathered = [torch.zeros_like(tensor) for _ in range(world)]
+            dist.all_gather(gathered, tensor)
+            ctx.world_size = world
+            ctx.rank = dist.get_rank()
+            return torch.stack(gathered, 0)
+        ctx.world_size = 1
+        ctx.rank = 0
+        return tensor.unsqueeze(0)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # grad_output: (world, ...) if world>1, else (1, ...)
+        if ctx.world_size == 1 or not (dist.is_available() and dist.is_initialized()):
+            return grad_output.squeeze(0)
+        # Aggregate gradients across ranks (safe default)
+        g = grad_output.contiguous()
+        dist.all_reduce(g)
+        return g[ctx.rank]
+
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss
+
+
+# Patch nnUNet dice AllGatherGrad to be safe when torch.distributed is not initialized.
+try:
+    import nnunetv2.training.loss.dice as _nnunet_dice_mod
+    _nnunet_dice_mod.AllGatherGrad = _SafeAllGatherGrad
+except Exception:
+    pass
 
 from nnunetv2.nets.mci_network import MCIUNetWrapper2D
 
@@ -40,6 +81,22 @@ def soft_dice_loss_binary_from_logits(logits: Tensor, target: Tensor, eps: float
     dice = (2.0 * inter + eps) / (denom + eps)
     return 1.0 - dice.mean()
 
+
+
+def autocast_ctx(device_type: str, enabled: bool = True):
+    """Version-robust autocast context for nnUNet trainers.
+    Uses torch.amp.autocast when available, otherwise falls back to torch.cuda.amp.autocast.
+    Returns nnUNet dummy_context for non-cuda devices.
+    """
+    from nnunetv2.utilities.helpers import dummy_context
+    if device_type != 'cuda':
+        return dummy_context()
+    try:
+        from torch.amp import autocast  # PyTorch >= 2.0 preferred API
+        return autocast(device_type='cuda', enabled=enabled)
+    except Exception:
+        from torch.cuda.amp import autocast  # legacy API
+        return autocast(enabled=enabled)
 
 def _dilate2d(x: Tensor, k: int = 3) -> Tensor:
     pad = k // 2
@@ -172,6 +229,9 @@ class nnUNetTrainerMCI(nnUNetTrainer):
         # CL erosion iterations at highest resolution; DS levels scale down
         self.cl_max_iters = int(getattr(self.configuration_manager, "cl_max_iters", 20))
 
+        # Edge band thickness (in pixels) for morphology-based edge target
+        self.edge_k = int(getattr(self.configuration_manager, "edge_k", 1))
+
     # ---------------------------
     # Helpers
     # ---------------------------
@@ -210,10 +270,22 @@ class nnUNetTrainerMCI(nnUNetTrainer):
             tgt_list.append(t)
         return tgt_list
 
-    # ---------------------------
-    # Train/Val steps
-    # ---------------------------
-    def train_step(self, batch: dict) -> dict:
+# ---------------------------
+# Train/Val steps
+# ---------------------------
+
+def _scaled_cl_iters(self, ds_level: int, hw: Tuple[int, int]) -> int:
+    """Scale CL erosion iterations for deep supervision outputs.
+    - Start from self.cl_max_iters at highest resolution (ds_level=0)
+    - Halve roughly per DS level
+    - Cap by feature map size to avoid vanishing (small maps)
+    """
+    h, w = int(hw[0]), int(hw[1])
+    base = max(1, int(self.cl_max_iters) // (2 ** int(ds_level)))
+    size_cap = max(1, min(h, w) // 6)
+    return int(min(base, size_cap))
+
+def train_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']  # can be list or tensor
 
@@ -225,11 +297,8 @@ class nnUNetTrainerMCI(nnUNetTrainer):
             target = target.to(self.device, non_blocking=True)
 
         self.optimizer.zero_grad(set_to_none=True)
-
         # Autocast only on CUDA (match nnUNetTrainer behavior)
-        from torch.cuda.amp import autocast
-        from nnunetv2.utilities.helpers import dummy_context
-        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+        with autocast_ctx(self.device.type, enabled=True):
             seg_outs, edge_outs, cl_outs = self.network(data, return_aux=True)
 
             # targets aligned high->low (list order must match seg_outs)
@@ -278,89 +347,86 @@ class nnUNetTrainerMCI(nnUNetTrainer):
             'loss_cl': float(total_cl.detach().cpu().numpy()),
         }
 
-    def validation_step(self, batch: dict) -> dict:
-        data = batch['data']
-        target = batch['target']
+def validation_step(self, batch: dict) -> dict:
+    data = batch['data']
+    target = batch['target']
 
-        data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [t.to(self.device, non_blocking=True) for t in target]
+    data = data.to(self.device, non_blocking=True)
+    if isinstance(target, list):
+        target = [t.to(self.device, non_blocking=True) for t in target]
+    else:
+        target = target.to(self.device, non_blocking=True)
+    from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
+
+    with torch.no_grad():
+        with autocast_ctx(self.device.type, enabled=True):
+            seg_outs, edge_outs, cl_outs = self.network(data, return_aux=True)
+
+            tgt_list = self._ensure_target_list(target, seg_outs)
+            weights = self._get_ds_weights(len(seg_outs))
+
+            total_seg = 0.0
+            total_edge = 0.0
+            total_cl = 0.0
+
+            for i, (seg_logits, edge_logits, cl_logits) in enumerate(zip(seg_outs, edge_outs, cl_outs)):
+                seg_gt = tgt_list[i].long()
+
+                total_seg = total_seg + weights[i] * self.loss_seg(seg_logits, seg_gt)
+                edge_gt = edge_from_multiclass(seg_gt, self.label_manager.num_segmentation_heads, k=self.edge_k)
+                total_edge = total_edge + weights[i] * (
+                    self.edge_bce(edge_logits, edge_gt) + soft_dice_loss_binary_from_logits(edge_logits, edge_gt)
+                )
+
+                iters_i = self._scaled_cl_iters(i, seg_logits.shape[-2:])
+                cl_gt = cl_heatmap_per_class(seg_gt, self.label_manager.num_segmentation_heads, iters=iters_i)
+                total_cl = total_cl + weights[i] * self.loss_cl(cl_logits, cl_gt)
+
+            loss = total_seg + self.lambda_edge * total_edge + self.lambda_cl * total_cl
+
+        # --- Online evaluation (match nnUNetTrainer expectations) ---
+        output = seg_outs[0] if self.enable_deep_supervision else seg_outs
+        gt_for_eval = tgt_list[0] if self.enable_deep_supervision else tgt_list
+
+        axes = [0] + list(range(2, output.ndim))
+        if self.label_manager.has_regions:
+            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
         else:
-            target = target.to(self.device, non_blocking=True)
+            output_seg = output.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
+            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+            del output_seg
 
-        from torch.cuda.amp import autocast
-        from nnunetv2.utilities.helpers import dummy_context
-        from nnunetv2.training.loss.dice import get_tp_fp_fn_tn
-
-        with torch.no_grad():
-            with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
-                seg_outs, edge_outs, cl_outs = self.network(data, return_aux=True)
-
-                tgt_list = self._ensure_target_list(target, seg_outs)
-                weights = self._get_ds_weights(len(seg_outs))
-
-                total_seg = 0.0
-                total_edge = 0.0
-                total_cl = 0.0
-
-                for i, (seg_logits, edge_logits, cl_logits) in enumerate(zip(seg_outs, edge_outs, cl_outs)):
-                    seg_gt = tgt_list[i].long()
-
-                    total_seg = total_seg + weights[i] * self.loss_seg(seg_logits, seg_gt)
-                    edge_gt = edge_from_multiclass(seg_gt, self.label_manager.num_segmentation_heads, k=self.edge_k)
-                    total_edge = total_edge + weights[i] * (
-                        self.edge_bce(edge_logits, edge_gt) + soft_dice_loss_binary_from_logits(edge_logits, edge_gt)
-                    )
-
-                    iters_i = self._scaled_cl_iters(i, seg_logits.shape[-2:])
-                    cl_gt = cl_heatmap_per_class(seg_gt, self.label_manager.num_segmentation_heads, iters=iters_i)
-                    total_cl = total_cl + weights[i] * self.loss_cl(cl_logits, cl_gt)
-
-                loss = total_seg + self.lambda_edge * total_edge + self.lambda_cl * total_cl
-
-            # --- Online evaluation (match nnUNetTrainer expectations) ---
-            output = seg_outs[0] if self.enable_deep_supervision else seg_outs
-            gt_for_eval = tgt_list[0] if self.enable_deep_supervision else tgt_list
-
-            axes = [0] + list(range(2, output.ndim))
+        if self.label_manager.has_ignore_label:
             if self.label_manager.has_regions:
-                predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+                mask = ~gt_for_eval[:, -1:]
             else:
-                output_seg = output.argmax(1)[:, None]
-                predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
-                predicted_segmentation_onehot.scatter_(1, output_seg, 1)
-                del output_seg
-
-            if self.label_manager.has_ignore_label:
-                if self.label_manager.has_regions:
+                # target can be long or bool
+                if gt_for_eval.dtype == torch.bool:
                     mask = ~gt_for_eval[:, -1:]
                 else:
-                    # target can be long or bool
-                    if gt_for_eval.dtype == torch.bool:
-                        mask = ~gt_for_eval[:, -1:]
-                    else:
-                        mask = 1 - gt_for_eval[:, -1:]
-                    gt_for_eval = gt_for_eval[:, :-1]
-            else:
-                mask = None
+                    mask = 1 - gt_for_eval[:, -1:]
+                gt_for_eval = gt_for_eval[:, :-1]
+        else:
+            mask = None
 
-            tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, gt_for_eval, axes=axes, mask=mask)
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, gt_for_eval, axes=axes, mask=mask)
 
-            tp_hard = tp.detach().cpu().numpy()
-            fp_hard = fp.detach().cpu().numpy()
-            fn_hard = fn.detach().cpu().numpy()
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
 
-            if not self.label_manager.has_regions:
-                tp_hard = tp_hard[1:]
-                fp_hard = fp_hard[1:]
-                fn_hard = fn_hard[1:]
+        if not self.label_manager.has_regions:
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
 
-        return {
-            'loss': loss.detach().cpu().numpy(),
-            'loss_seg': float(total_seg.detach().cpu().numpy()),
-            'loss_edge': float(total_edge.detach().cpu().numpy()),
-            'loss_cl': float(total_cl.detach().cpu().numpy()),
-            'tp_hard': tp_hard,
-            'fp_hard': fp_hard,
-            'fn_hard': fn_hard,
-        }
+    return {
+        'loss': loss.detach().cpu().numpy(),
+        'loss_seg': float(total_seg.detach().cpu().numpy()),
+        'loss_edge': float(total_edge.detach().cpu().numpy()),
+        'loss_cl': float(total_cl.detach().cpu().numpy()),
+        'tp_hard': tp_hard,
+        'fp_hard': fp_hard,
+        'fn_hard': fn_hard,
+    }
