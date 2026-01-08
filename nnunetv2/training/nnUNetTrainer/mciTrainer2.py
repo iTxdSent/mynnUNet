@@ -160,7 +160,7 @@ def soft_dice_loss_binary_from_logits(logits: Tensor, target: Tensor, eps: float
 # -----------------------------------------------------------------------------
 # Trainer
 # -----------------------------------------------------------------------------
-class nnUNetTrainerMCI(nnUNetTrainer):
+class nnUNetTrainerMCI2(nnUNetTrainer):
     # ---------------------------
     # Build & mount network
     # ---------------------------
@@ -209,7 +209,7 @@ class nnUNetTrainerMCI(nnUNetTrainer):
 
         # Target weights (what you will set to 0.3 / 0.1)
         self.lambda_edge_target = float(getattr(self.configuration_manager, "lambda_edge", 0.3))
-        self.lambda_cl_target = float(getattr(self.configuration_manager, "lambda_cl", 0.15))
+        self.lambda_cl_target = float(getattr(self.configuration_manager, "lambda_cl", 0.2))
 
         # Warmup & ramp
         self.aux_warmup_epochs = int(getattr(self.configuration_manager, "aux_warmup_epochs", 20))
