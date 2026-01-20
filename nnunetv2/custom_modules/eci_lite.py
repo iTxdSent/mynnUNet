@@ -164,10 +164,22 @@ class ECILite(nn.Module):
         # runtime scaling buffer
         self.register_buffer("inject_scale", torch.tensor(float(self.cfg.inject_scale_init), dtype=torch.float32))
 
+        # Whether to compute/return edge logits for auxiliary supervision.
+        # Note: feature injection does NOT depend on this flag.
+        self._edge_head_enabled: bool = True
+
         self.debug_last: Dict[str, Any] = {}
 
     def set_inject_scale(self, s: float) -> None:
         self.inject_scale.fill_(float(s))
+
+    def set_edge_head_enabled(self, enabled: bool) -> None:
+        """Enable/disable the auxiliary edge head computation."""
+        self._edge_head_enabled = bool(enabled)
+
+    @property
+    def edge_head_enabled(self) -> bool:
+        return bool(self._edge_head_enabled)
 
     def _edge_features(self, x: torch.Tensor) -> torch.Tensor:
         if self._edge_mode == "depthwise":
@@ -213,7 +225,10 @@ class ECILite(nn.Module):
 
         y = x + self.inject_scale.to(dtype=x.dtype, device=x.device) * inj
 
-        edge_logits = self.edge_head(edge_feat.detach() if self.cfg.detach_edge_loss else edge_feat)
+        # Edge logits are only needed for auxiliary supervision. When disabled, skip the edge head entirely.
+        edge_logits = None
+        if self._edge_head_enabled and return_edge_logits:
+            edge_logits = self.edge_head(edge_feat.detach() if self.cfg.detach_edge_loss else edge_feat)
 
         if store_debug:
             with torch.no_grad():
@@ -225,6 +240,11 @@ class ECILite(nn.Module):
                 }
 
         if return_edge_logits:
+            if edge_logits is None:
+                raise RuntimeError(
+                    "return_edge_logits=True but edge_head is disabled. "
+                    "Enable edge head or call with return_edge_logits=False."
+                )
             return y, edge_logits
         return y
 def build_eci_lite_pyramid(

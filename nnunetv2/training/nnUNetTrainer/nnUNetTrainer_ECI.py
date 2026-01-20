@@ -122,7 +122,7 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
     # Edge supervision schedule
     edge_loss_enabled: bool = True
     edge_loss_warmup_epochs: int = 20
-    edge_loss_max_weight: float = 0.1
+    edge_loss_max_weight: float = 0.2
     edge_band_px: int = 1  # morphological edge band width
     edge_bce_weight: float = 1.0
     edge_dice_weight: float = 1.0
@@ -224,6 +224,12 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
 
         self.optimizer.zero_grad(set_to_none=True)
 
+        # Determine the current edge-loss weight before forward so we can
+        # disable the edge head when edge supervision is off (saves compute).
+        w_edge = self._edge_loss_weight()  # current epoch weight (lambda)
+        if hasattr(self.network, "set_eci_edge_head_enabled"):
+            self.network.set_eci_edge_head_enabled(w_edge > 0)
+
         # 混合精度上下文
         with torch.autocast(self.device.type, enabled=True):
             output = self.network(data)
@@ -231,7 +237,6 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
             l_seg = self.loss(output, target)
             # 3. 计算 Edge Loss
             l_edge = torch.zeros((), device=self.device)
-            w_edge = self._edge_loss_weight() # 获取当前 epoch 的权重 (lambda)
             if w_edge > 0:
                 # 调用你写好的计算函数
                 l_edge = self._compute_edge_loss(target)
@@ -251,7 +256,9 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
             self.optimizer.step()
         # 返回日志字典
         return {
-            'loss': l_seg.detach().cpu().numpy(), 
-            'edge_loss': l_edge.detach().cpu().numpy()
+            'loss': total_loss.detach().cpu().numpy(),
+            'seg_loss': l_seg.detach().cpu().numpy(),
+            'edge_loss': l_edge.detach().cpu().numpy(),
+            'w_edge': float(w_edge),
         }
 
