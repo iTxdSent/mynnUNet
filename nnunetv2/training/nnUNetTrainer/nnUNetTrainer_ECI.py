@@ -111,7 +111,7 @@ def soft_dice_loss(prob: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> t
     return 1.0 - (num / den).mean()
 
 
-class nnUNetTrainer_ECInoLoss(nnUNetTrainer):
+class nnUNetTrainer_ECI(nnUNetTrainer):
     # ------------------------
     # Hyperparameters (adjust at class level or in __init__)
     # ------------------------

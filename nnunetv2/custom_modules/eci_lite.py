@@ -9,51 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.modules.conv import _ConvNd
 
-
-def mask_to_edge_band_torch(mask: torch.Tensor, radius: int = 1, *, assume_binary: bool = True) -> torch.Tensor:
-    """
-    Generate a binary "edge band" from a binary mask via morphological gradient:
-        edge = dilate(mask) - erode(mask)
-
-    Pure torch (MaxPool-based). Supports shapes:
-      (H,W) | (B,H,W) | (B,1,H,W)
-
-    Returns the same rank as input (float tensor in [0,1]).
-    """
-    if radius <= 0:
-        raise ValueError("radius must be >= 1")
-
-    if mask.ndim == 2:
-        m = mask[None, None]
-        squeeze_back = 2
-    elif mask.ndim == 3:
-        m = mask[:, None]
-        squeeze_back = 3
-    elif mask.ndim == 4:
-        m = mask
-        squeeze_back = 4
-    else:
-        raise ValueError(f"mask must be 2D/3D/4D, got shape {tuple(mask.shape)}")
-
-    if m.shape[1] != 1:
-        raise ValueError(f"mask channel must be 1, got C={m.shape[1]}")
-
-    m = m.float()
-    if assume_binary:
-        m = (m > 0.5).float()
-
-    k = 2 * radius + 1
-    dil = F.max_pool2d(m, kernel_size=k, stride=1, padding=radius)
-    ero = -F.max_pool2d(-m, kernel_size=k, stride=1, padding=radius)
-    edge = (dil - ero).clamp(0.0, 1.0)
-
-    if squeeze_back == 2:
-        return edge[0, 0]
-    if squeeze_back == 3:
-        return edge[:, 0]
-    return edge
-
-
 # [NEW] SE Block Implementation
 class SEBlock(nn.Module):
     def __init__(self, channels: int, reduction: int = 4):
@@ -173,9 +128,6 @@ class ECILite(nn.Module):
 
     def set_inject_scale(self, s: float) -> None:
         self.inject_scale.fill_(float(s))
-
-    def set_edge_head_enabled(self, enabled: bool) -> None:
-        self.edge_head_enabled = bool(enabled)
 
     def set_edge_head_enabled(self, enabled: bool) -> None:
         self.edge_head_enabled = bool(enabled)
