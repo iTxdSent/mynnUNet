@@ -131,7 +131,22 @@ class PlainConvUNetWithECI(PlainConvUNet):
             )
 
         self.eci_cfg = eci_cfg if eci_cfg is not None else ECILiteConfig()
-        self.eci_apply_levels = set(int(i) for i in (eci_apply_levels or range(len(features_per_stage) - 1)))
+        n_dec = len(features_per_stage) - 1
+
+        if eci_apply_levels is None:
+            levels = list(range(n_dec))          # all
+        else:
+            levels = list(eci_apply_levels)      # allow []
+
+        norm_levels = []
+        for i in levels:
+            i = int(i)
+            if i < 0:
+                i = n_dec + i                    # -1 -> last
+            if 0 <= i < n_dec:
+                norm_levels.append(i)
+
+        self.eci_apply_levels = set(norm_levels)
 
         # Build ECI modules for decoder stages
         self.eci_modules = build_eci_lite_pyramid(

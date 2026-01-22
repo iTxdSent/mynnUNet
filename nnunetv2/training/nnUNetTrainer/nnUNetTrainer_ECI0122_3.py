@@ -111,13 +111,13 @@ def soft_dice_loss(prob: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> t
     return 1.0 - (num / den).mean()
 
 
-class nnUNetTrainer_ECI(nnUNetTrainer):
+class nnUNetTrainer_ECI_0122_3(nnUNetTrainer):
     # ------------------------
     # Hyperparameters (adjust at class level or in __init__)
     # ------------------------
     # ECI feature injection schedule
-    eci_inject_warmup_epochs: int = 20
-    eci_inject_max_scale: float = 1.0
+    eci_inject_warmup_epochs: int = 10
+    eci_inject_max_scale: float = 0.5
 
     # Edge supervision schedule
     edge_loss_enabled: bool = False
@@ -129,8 +129,7 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
 
     # Which decoder stages to supervise for edge:
     # By default supervise only the highest-resolution stage to keep it lightweight.
-    edge_supervision_levels: Optional[Sequence[int]] = None  # None -> [全开]
-
+    edge_supervision_levels: Optional[Sequence[int]] = [-1]  # None -> [last_stage]
 
     @staticmethod
     def build_network_architecture(
