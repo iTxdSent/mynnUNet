@@ -311,6 +311,18 @@ class HFFE(nn.Module):
         high_term = swm_fuse * self.proj_high(f_high_p + x_high_up)
 
         out = self.out_conv(torch.cat([low_term, high_term], dim=1))
+
+
+        if self.debug:
+            self._save_debug(swm_low, swm_high, swm_fuse)
+
+        if self.use_residual_gate:
+            # stable warmup: out = x_low + s*(out - x_low)
+            #s = float(self.gate_scale.item())
+            s = self.gate_scale.to(dtype=out.dtype, device=out.device).clamp_(0.0, 1.0)
+            out = x_low + s * (out - x_low)
+
+
         return out
 
 
@@ -342,17 +354,6 @@ class HFFE(nn.Module):
         #out = self.out_conv(torch.cat([low_term, high_term], dim=1))
         #------ 上面是魔改版---------#
 
-
-        if self.debug:
-            self._save_debug(swm_low, swm_high, swm_fuse)
-
-        if self.use_residual_gate:
-            # stable warmup: out = x_low + s*(out - x_low)
-            #s = float(self.gate_scale.item())
-            s = self.gate_scale.to(dtype=out.dtype, device=out.device).clamp_(0.0, 1.0)
-            out = x_low + s * (out - x_low)
-
-        return out
 
 
 def build_hffe_pyramid(

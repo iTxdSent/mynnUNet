@@ -111,7 +111,7 @@ def soft_dice_loss(prob: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> t
     return 1.0 - (num / den).mean()
 
 
-class nnUNetTrainer_ECI3(nnUNetTrainer):
+class nnUNetTrainer_ECI0122(nnUNetTrainer):
     # ------------------------
     # Hyperparameters (adjust at class level or in __init__)
     # ------------------------
@@ -141,7 +141,7 @@ class nnUNetTrainer_ECI3(nnUNetTrainer):
         enable_deep_supervision: bool = True
     ) -> nn.Module:
         # Force using our custom architecture, independent of what plans say.
-        architecture_class_name = "nnunetv2.network_architecture.plainconvunet_eci.PlainConvUNetWithECI"
+        architecture_class_name = "nnunetv2.network_architecture.plainconvunet_eci_0122.PlainConvUNetWithECI"
         return get_network_from_plans(
             architecture_class_name,
             arch_init_kwargs,
@@ -213,45 +213,6 @@ class nnUNetTrainer_ECI3(nnUNetTrainer):
         return torch.stack(losses).mean()
 
     def train_step(self, batch: dict) -> dict:
-        data = batch['data']
-        target = batch['target']
-
-        data = data.to(self.device, non_blocking=True)
-        if isinstance(target, list):
-            target = [i.to(self.device, non_blocking=True) for i in target]
-        else:
-            target = target.to(self.device, non_blocking=True)
-
-        self.optimizer.zero_grad(set_to_none=True)
-
-        # 混合精度上下文
-        with torch.autocast(self.device.type, enabled=True):
-            output = self.network(data)
-            # 2. 计算主分割 Loss
-            l_seg = self.loss(output, target)
-            # 3. 计算 Edge Loss
-            l_edge = torch.zeros((), device=self.device)
-            w_edge = self._edge_loss_weight() # 获取当前 epoch 的权重 (lambda)
-            if w_edge > 0:
-                # 调用你写好的计算函数
-                l_edge = self._compute_edge_loss(target)
-                total_loss = l_seg + w_edge * l_edge
-            else:
-                total_loss = l_seg
-        # 4. 反向传播与优化 (标准 nnUNet 流程)
-        if self.grad_scaler is not None:
-            self.grad_scaler.scale(total_loss).backward()
-            self.grad_scaler.unscale_(self.optimizer)
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.grad_scaler.step(self.optimizer)
-            self.grad_scaler.update()
-        else:
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
-            self.optimizer.step()
-        # 返回日志字典
-        return {
-            'loss': l_seg.detach().cpu().numpy(), 
-            'edge_loss': l_edge.detach().cpu().numpy()
-        }
+        """Use nnUNet base implementation (keeps AMP/compile compatibility)."""
+        return super().train_step(batch)
 

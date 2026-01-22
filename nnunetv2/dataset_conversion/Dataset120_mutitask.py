@@ -42,9 +42,9 @@ def load_and_covnert_case(input_image: str, input_seg: str, output_image: str, o
 
 
 if __name__ == "__main__":
-    source = '/data0/users/liuxiangdong/data/BV3'
+    source = '/data0/users/liuxiangdong/data_final/BV140'
 
-    dataset_name = 'Dataset136_BV3'
+    dataset_name = 'Dataset140_BV140'
 
     imagestr = join(nnUNet_raw, dataset_name, 'imagesTr')
     imagests = join(nnUNet_raw, dataset_name, 'imagesTs')

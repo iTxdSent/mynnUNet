@@ -1,4 +1,4 @@
-# nnunetv2/custom_modules/ughi_pure_lite.py
+# nnunetv2/custom_modules/ughi.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,7 +11,7 @@ from torch.nn.modules.conv import _ConvNd
 
 
 @dataclass
-class PureUGHILiteConfig:
+class UGHIConfig:
     # 是否使用更深一层的 edge gate
     use_edge_gate: bool = True
     # 是否对 edge gate 做 detach（强烈建议 True，显存/图依赖关键）
@@ -22,9 +22,9 @@ class PureUGHILiteConfig:
     align_corners: bool = False
 
 
-class PureUGHILite(nn.Module):
+class UGHI(nn.Module):
     """
-    纯粹 UGHI（Lite版，显存友好）：
+    UGHI（显存友好）：
     - 只增强竖向 upsample 特征 x_up
     - 语义门控用 1-channel spatial gate（避免 B×C×H×W attention map）
     - prev edge gate 默认 detach，避免把 deep edge head 接入主分割反传路径
@@ -35,11 +35,11 @@ class PureUGHILite(nn.Module):
         conv_op: Type[_ConvNd],
         up_ch: int,
         hffe_ch: int,
-        cfg: Optional[PureUGHILiteConfig] = None,
+        cfg: Optional[UGHIConfig] = None,
         conv_bias: bool = True,
     ):
         super().__init__()
-        self.cfg = cfg if cfg is not None else PureUGHILiteConfig()
+        self.cfg = cfg if cfg is not None else UGHIConfig()
 
         self.h_proj = conv_op(hffe_ch, up_ch, kernel_size=1, stride=1, padding=0, bias=conv_bias)
         self.sem_gate = conv_op(up_ch, 1, kernel_size=1, stride=1, padding=0, bias=True)  # spatial gate

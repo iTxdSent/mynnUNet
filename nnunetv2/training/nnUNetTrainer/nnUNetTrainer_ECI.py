@@ -111,7 +111,7 @@ def soft_dice_loss(prob: torch.Tensor, gt: torch.Tensor, eps: float = 1e-6) -> t
     return 1.0 - (num / den).mean()
 
 
-class nnUNetTrainer_ECI(nnUNetTrainer):
+class nnUNetTrainer_ECInoLoss(nnUNetTrainer):
     # ------------------------
     # Hyperparameters (adjust at class level or in __init__)
     # ------------------------
@@ -120,9 +120,9 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
     eci_inject_max_scale: float = 1.0
 
     # Edge supervision schedule
-    edge_loss_enabled: bool = True
+    edge_loss_enabled: bool = False
     edge_loss_warmup_epochs: int = 20
-    edge_loss_max_weight: float = 0.2
+    edge_loss_max_weight: float = 0.1
     edge_band_px: int = 1  # morphological edge band width
     edge_bce_weight: float = 1.0
     edge_dice_weight: float = 1.0
@@ -213,6 +213,14 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
         return torch.stack(losses).mean()
 
     def train_step(self, batch: dict) -> dict:
+        # ====== 模式A：完全对齐旧版本实际训练行为（旧版就是 super().train_step）======
+        if not bool(self.edge_loss_enabled):
+            # 可选但建议：关掉 edge head，避免 decoder wrapper 请求 edge logits
+            if hasattr(self.network, "set_eci_edge_head_enabled"):
+                self.network.set_eci_edge_head_enabled(False)
+            return super().train_step(batch)
+
+        # ====== 模式B：启用 edge loss（保留你现在的新逻辑）======
         data = batch['data']
         target = batch['target']
 
@@ -224,26 +232,18 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
 
         self.optimizer.zero_grad(set_to_none=True)
 
-        # Determine the current edge-loss weight before forward so we can
-        # disable the edge head when edge supervision is off (saves compute).
-        w_edge = self._edge_loss_weight()  # current epoch weight (lambda)
-        if hasattr(self.network, "set_eci_edge_head_enabled"):
+        w_edge = float(self._edge_loss_weight())
+        if hasattr(self.network, 'set_eci_edge_head_enabled'):
             self.network.set_eci_edge_head_enabled(w_edge > 0)
 
-        # 混合精度上下文
         with torch.autocast(self.device.type, enabled=True):
             output = self.network(data)
-            # 2. 计算主分割 Loss
             l_seg = self.loss(output, target)
-            # 3. 计算 Edge Loss
             l_edge = torch.zeros((), device=self.device)
             if w_edge > 0:
-                # 调用你写好的计算函数
                 l_edge = self._compute_edge_loss(target)
-                total_loss = l_seg + w_edge * l_edge
-            else:
-                total_loss = l_seg
-        # 4. 反向传播与优化 (标准 nnUNet 流程)
+            total_loss = l_seg + (w_edge * l_edge)
+
         if self.grad_scaler is not None:
             self.grad_scaler.scale(total_loss).backward()
             self.grad_scaler.unscale_(self.optimizer)
@@ -254,11 +254,11 @@ class nnUNetTrainer_ECI(nnUNetTrainer):
             total_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
-        # 返回日志字典
+
         return {
-            'loss': total_loss.detach().cpu().numpy(),
-            'seg_loss': l_seg.detach().cpu().numpy(),
-            'edge_loss': l_edge.detach().cpu().numpy(),
+            'loss': float(total_loss.detach().cpu().item()),
+            'seg_loss': float(l_seg.detach().cpu().item()),
+            'edge_loss': float(l_edge.detach().cpu().item()),
             'w_edge': float(w_edge),
         }
 

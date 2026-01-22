@@ -1,4 +1,4 @@
-# nnunetv2/network_architecture/plainconvunet_hffe_eci_ughi_pure_lite.py
+# nnunetv2/network_architecture/plainconvunet_hffe_eci_ughi.py
 from __future__ import annotations
 
 import inspect
@@ -12,7 +12,7 @@ from dynamic_network_architectures.architectures.unet import PlainConvUNet
 
 from nnunetv2.custom_modules.hffe_module import build_hffe_pyramid
 from nnunetv2.custom_modules.eci_lite import ECILite, ECILiteConfig
-from nnunetv2.custom_modules.ughi_pure import PureUGHILite, PureUGHILiteConfig
+from nnunetv2.custom_modules.ughi import UGHI, UGHIConfig
 
 
 def _bind_plainconv_init_args(args, kwargs) -> Dict[str, Any]:
@@ -21,7 +21,7 @@ def _bind_plainconv_init_args(args, kwargs) -> Dict[str, Any]:
     return dict(bound.arguments)
 
 
-class PlainConvUNetWithHFFE_ECI_PureUGHILite(PlainConvUNet):
+class PlainConvUNetWithHFFE_ECI_UGHI(PlainConvUNet):
     """
     修正版（显存正确）：
     - 不 wrap decoder.stages（避免二次 cat）
@@ -49,7 +49,7 @@ class PlainConvUNetWithHFFE_ECI_PureUGHILite(PlainConvUNet):
         # UGHI
         ughi_enabled: bool = True,
         ughi_apply_levels: Optional[Sequence[int]] = None,         # decoder stage indices
-        ughi_cfg: Optional[PureUGHILiteConfig] = None,
+        ughi_cfg: Optional[UGHIConfig] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -117,7 +117,7 @@ class PlainConvUNetWithHFFE_ECI_PureUGHILite(PlainConvUNet):
         ughi_apply = set(range(self._n_dec)) if ughi_apply_levels is None else set(int(i) for i in ughi_apply_levels)
 
         self.eci_cfg = eci_cfg if eci_cfg is not None else ECILiteConfig()
-        self.ughi_cfg = ughi_cfg if ughi_cfg is not None else PureUGHILiteConfig()
+        self.ughi_cfg = ughi_cfg if ughi_cfg is not None else UGHIConfig()
 
         # ---- build per-stage ECI/UGHI lists ----
         self.eci_modules = nn.ModuleList()
@@ -133,7 +133,7 @@ class PlainConvUNetWithHFFE_ECI_PureUGHILite(PlainConvUNet):
 
             if bool(ughi_enabled) and (s in ughi_apply):
                 self.ughi_modules.append(
-                    PureUGHILite(conv_op=conv_op, up_ch=ch, hffe_ch=hffe_ch, cfg=self.ughi_cfg, conv_bias=bool(conv_bias))
+                    UGHI(conv_op=conv_op, up_ch=ch, hffe_ch=hffe_ch, cfg=self.ughi_cfg, conv_bias=bool(conv_bias))
                 )
             else:
                 self.ughi_modules.append(nn.Identity())
@@ -194,6 +194,17 @@ class PlainConvUNetWithHFFE_ECI_PureUGHILite(PlainConvUNet):
         seg_outputs = []
         prev_gate: Optional[torch.Tensor] = None  # (B,1,H,W) prob map, detached recommended
 
+        # nnUNet toggles deep supervision during inference; different code paths use different flags.
+        # We resolve do_ds in a robust order so that predictor can disable it cleanly.
+        do_ds = getattr(self, "do_ds", None)
+        if do_ds is None:
+            do_ds = getattr(self, "deep_supervision", None)
+        if do_ds is None:
+            do_ds = getattr(self, "enable_deep_supervision", None)
+        if do_ds is None:
+            do_ds = getattr(dec, "deep_supervision", False)
+        do_ds = bool(do_ds)
+
         for s in range(len(dec.stages)):
             x_up = dec.transpconvs[s](lres_input)
 
@@ -226,13 +237,17 @@ class PlainConvUNetWithHFFE_ECI_PureUGHILite(PlainConvUNet):
                 self._edge_logits_cache[s] = None
                 prev_gate = None
 
-            # deep supervision (keep decoder behavior)
-            if getattr(dec, "deep_supervision", False):
+            # deep supervision behavior must match nnUNet expectations:
+            # - during training/regular validation: return list (deep supervision)
+            # - during inference/sliding-window: return a Tensor (no deep supervision)
+            if do_ds:
                 seg_outputs.append(dec.seg_layers[s](x_stage))
             elif s == (len(dec.stages) - 1):
-                seg_outputs.append(dec.seg_layers[-1](x_stage))
+                out = dec.seg_layers[-1](x_stage)
 
             lres_input = x_stage
 
-        seg_outputs = seg_outputs[::-1]
-        return seg_outputs
+        if do_ds:
+            seg_outputs = seg_outputs[::-1]
+            return seg_outputs
+        return out

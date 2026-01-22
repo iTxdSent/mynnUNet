@@ -161,12 +161,13 @@ class ECILite(nn.Module):
         self.edge_proj = conv_op(self.edge_channels, self.channels, kernel_size=1, padding=0, bias=True)
         self.edge_head = conv_op(self.edge_channels, 1, kernel_size=1, padding=0, bias=True)
 
+        # Whether to compute edge logits head. Trainer may disable this when edge loss is off.
+        # When disabled, the injection path remains active (uses edge features + gates),
+        # but edge_logits will not be produced.
+        self.edge_head_enabled: bool = True
+
         # runtime scaling buffer
         self.register_buffer("inject_scale", torch.tensor(float(self.cfg.inject_scale_init), dtype=torch.float32))
-
-        # Whether to compute/return edge logits for auxiliary supervision.
-        # Note: feature injection does NOT depend on this flag.
-        self._edge_head_enabled: bool = True
 
         self.debug_last: Dict[str, Any] = {}
 
@@ -174,12 +175,10 @@ class ECILite(nn.Module):
         self.inject_scale.fill_(float(s))
 
     def set_edge_head_enabled(self, enabled: bool) -> None:
-        """Enable/disable the auxiliary edge head computation."""
-        self._edge_head_enabled = bool(enabled)
+        self.edge_head_enabled = bool(enabled)
 
-    @property
-    def edge_head_enabled(self) -> bool:
-        return bool(self._edge_head_enabled)
+    def set_edge_head_enabled(self, enabled: bool) -> None:
+        self.edge_head_enabled = bool(enabled)
 
     def _edge_features(self, x: torch.Tensor) -> torch.Tensor:
         if self._edge_mode == "depthwise":
@@ -210,6 +209,11 @@ class ECILite(nn.Module):
         if return_edge_logits is None:
             return_edge_logits = bool(self.cfg.return_edge_logits_default)
 
+        if bool(return_edge_logits) and (not bool(self.edge_head_enabled)):
+            raise RuntimeError(
+                "return_edge_logits=True but edge_head is disabled. Enable edge head or call with return_edge_logits=False."
+            )
+
         edge_feat = self._edge_features(x)
         # Apply SE Block before gating (Channel Attention first)
         if self.cfg.use_se:
@@ -225,9 +229,10 @@ class ECILite(nn.Module):
 
         y = x + self.inject_scale.to(dtype=x.dtype, device=x.device) * inj
 
-        # Edge logits are only needed for auxiliary supervision. When disabled, skip the edge head entirely.
         edge_logits = None
-        if self._edge_head_enabled and return_edge_logits:
+        if bool(self.edge_head_enabled):
+            # Only compute edge logits when enabled. This can be disabled to save compute/memory
+            # when edge loss is turned off in the trainer.
             edge_logits = self.edge_head(edge_feat.detach() if self.cfg.detach_edge_loss else edge_feat)
 
         if store_debug:
@@ -240,11 +245,6 @@ class ECILite(nn.Module):
                 }
 
         if return_edge_logits:
-            if edge_logits is None:
-                raise RuntimeError(
-                    "return_edge_logits=True but edge_head is disabled. "
-                    "Enable edge head or call with return_edge_logits=False."
-                )
             return y, edge_logits
         return y
 def build_eci_lite_pyramid(

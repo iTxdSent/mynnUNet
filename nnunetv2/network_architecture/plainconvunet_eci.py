@@ -62,16 +62,37 @@ def _locate_decoder_stages(decoder: nn.Module) -> Tuple[str, nn.ModuleList]:
 
 
 class _DecoderStageWithECI(nn.Module):
+    """
+    Wrap a per-stage conv stack so that:
+      y = stage(x)
+      y = eci(y)
+    and store edge logits for this stage (optional).
+    """
     def __init__(self, stage: nn.Module, eci: nn.Module, edge_cache: list, stage_idx: int):
         super().__init__()
         self.stage = stage
         self.eci = eci
-        self.edge_cache = edge_cache  # 普通 list，不是 nn.Module
+        # IMPORTANT: do NOT hold a reference to the parent nn.Module here.
+        # Storing the full network as a submodule creates a module-cycle and breaks
+        # nn.Module.apply()/state_dict() traversal. Use a plain python list as cache.
+        self.edge_cache = edge_cache
         self.stage_idx = int(stage_idx)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = self.stage(x)
-        y2, edge_logits = self.eci(y, return_edge_logits=True)
+        # Store edge logits only when edge head is enabled.
+        # When edge loss is disabled, trainer may disable edge_head to save compute/memory.
+        need_edge = bool(getattr(self.eci, 'edge_head_enabled', True))
+        out = self.eci(y, return_edge_logits=need_edge)
+        if need_edge:
+            y2, edge_logits = out
+        else:
+            # Some implementations may return only y, or (y, None). Handle both.
+            if isinstance(out, (tuple, list)):
+                y2 = out[0]
+            else:
+                y2 = out
+            edge_logits = None
         self.edge_cache[self.stage_idx] = edge_logits
         return y2
 
@@ -145,6 +166,8 @@ class PlainConvUNetWithECI(PlainConvUNet):
         setattr(self.decoder, stage_attr, wrapped)
 
     def reset_eci_cache(self) -> None:
+        # IMPORTANT: in-place reset (do NOT rebind the list), because decoder wrappers
+        # hold a reference to this list as edge_cache.
         for i in range(len(self._eci_edge_logits)):
             self._eci_edge_logits[i] = None
 
