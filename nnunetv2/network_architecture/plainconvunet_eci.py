@@ -146,7 +146,13 @@ class PlainConvUNetWithECI(PlainConvUNet):
             if 0 <= i < n_dec:
                 norm_levels.append(i)
 
+        # IMPORTANT: distinguish between "user explicitly gave []" (means NONE)
+        # and "user gave something but all indices invalid" (fallback to last)
+        if eci_apply_levels is not None and len(levels) > 0 and len(norm_levels) == 0:
+            norm_levels = [n_dec - 1]
+
         self.eci_apply_levels = set(norm_levels)
+
 
         # Build ECI modules for decoder stages
         self.eci_modules = build_eci_lite_pyramid(
